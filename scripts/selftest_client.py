@@ -325,6 +325,17 @@ def seed() -> int:
     check(all(i["crosses_midnight"] for i in aps2_result["impacts"]),
           "all offset-window impacts flagged cross-midnight")
 
+    print("== seed: half-open midnight semantics ==")
+    # Open-ended closure keeps an unconfirmed flag (null), never a fabricated day.
+    check(
+        all(i["crosses_midnight"] is None for i in bsr_result["impacts"]),
+        "open-ended closure cross-midnight is unconfirmed (null)",
+    )
+
+    status, amendments = request("GET", "/api/v1/projection-amendments")
+    check(status == 200 and isinstance(amendments.get("amendments"), list),
+          "projection amendments audit endpoint is reachable on a fresh database")
+
     print("== seed: summaries, filters, pagination ==")
     status, summary = request("GET", "/api/v1/airports/APS/summary")
     check(status == 200, "APS summary 200")
@@ -373,6 +384,40 @@ def seed() -> int:
     for invalid_id in invalid_ids:
         status, _ = request("GET", f"/api/v1/events/{invalid_id}")
         check(status == 404, f"rejected event '{invalid_id}' was never persisted")
+
+    print("== seed: half-open midnight boundary (end exactly at midnight) ==")
+    # Independent new APS chains after the count assertions above. Both windows
+    # only overlap AX410 (departs 15:30Z), so the flight/airport pair total of
+    # the latest view is unchanged.
+    exact_midnight = {
+        "event_id": "volc-aps-exactmid",
+        "event_version": 4,
+        "event_type": "airport.closed",
+        "airport_code": "APS",
+        "effective_from": "2026-09-07T15:00:00Z",
+        "effective_until": "2026-09-07T16:00:00Z",  # == local 00:00: open end
+        "reported_at": "2026-09-07T14:00:00Z",
+    }
+    status, exact_result = post_event(exact_midnight)
+    check(status == 201, f"exact-midnight closure accepted (got {status})")
+    check(exact_result.get("projection_version") == 2,
+          "impact snapshots are tagged projection_version 2")
+    check(exact_result["impacts"], "exact-midnight window still impacts AX410")
+    check(
+        all(i["crosses_midnight"] is False for i in exact_result["impacts"]),
+        "window ending exactly at local midnight is NOT cross-day (half-open)",
+    )
+
+    micro = dict(exact_midnight)
+    micro["event_id"] = "volc-aps-micromid"
+    micro["event_version"] = 5
+    micro["effective_until"] = "2026-09-07T16:00:00.000001Z"  # 1 us into next day
+    status, micro_result = post_event(micro)
+    check(status == 201, f"microsecond-past-midnight closure accepted (got {status})")
+    check(
+        all(i["crosses_midnight"] is True for i in micro_result["impacts"]),
+        "window ending one microsecond past midnight IS cross-day",
+    )
 
     print("== seed: health ==")
     status, health = request("GET", "/healthz")
@@ -425,6 +470,33 @@ def verify() -> int:
     _, page = request("GET", "/api/v1/flights/affected?limit=100")
     check(page["pagination"]["total"] == 6,
           f"latest affected-flight view still totals 6 (got {page['pagination']['total']})")
+
+    print("== verify: half-open midnight verdicts survived the restart ==")
+    status, exact = request("GET", f"/api/v1/events/volc-aps-exactmid")
+    check(status == 200, "exact-midnight event survived restart")
+    check(
+        all(i["crosses_midnight"] is False for i in exact.get("impacts", [])),
+        "exact-midnight window still NOT cross-day after restart",
+    )
+    check(
+        exact["processing"]["window_verdict"]["crosses_midnight"] is False,
+        "exact-midnight window verdict is false after restart",
+    )
+    status, micro = request("GET", f"/api/v1/events/volc-aps-micromid")
+    check(status == 200, "microsecond-past-midnight event survived restart")
+    check(
+        all(i["crosses_midnight"] is True for i in micro.get("impacts", [])),
+        "microsecond-past-midnight window still cross-day after restart",
+    )
+    status, old = request(
+        "GET", f"/api/v1/events/{APS_CLOSE}?projection_version=1"
+    )
+    # APS_CLOSE was authored under the current code (v2); v1 must not be invented.
+    check(status == 422,
+          f"a never-existing projection version is rejected (got {status})")
+    status, amendments = request("GET", "/api/v1/projection-amendments")
+    check(status == 200 and isinstance(amendments.get("amendments"), list),
+          "projection amendments audit endpoint reachable after restart")
 
     print("== verify: idempotency still works against persisted state ==")
     aps_close_2 = {

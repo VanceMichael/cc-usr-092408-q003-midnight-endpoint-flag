@@ -31,6 +31,14 @@ STATE_REPLAYED = "replayed"
 
 CLOSED_TYPES = (EVENT_CLOSED, EVENT_EXTENDED)
 
+# Projection/calculation version. Bumped whenever the impact verdict semantics
+# change. v1 used a closed-date comparison that flagged a window ending exactly
+# at local midnight as cross-day; v2 applies the half-open rule ([start,end)):
+# midnight itself is not inside the window. Persisted snapshots carry the
+# version they were computed under, so old adjudication results remain
+# queryable while current reads use the newest version.
+CALC_VERSION = 2
+
 
 @dataclass(frozen=True)
 class Airport:
@@ -86,8 +94,14 @@ class DisruptionEvent:
 
 
 def iso_utc(dt: datetime) -> str:
-    """将带时区时间输出为规范的 UTC ISO 8601 字符串。"""
+    """将带时区时间输出为规范的 UTC ISO 8601 字符串。
+
+    微秒非零时以小数秒保留，避免带秒/微秒的端点在落库与重开库后发生
+    精度丢失；微秒为零时仍输出整秒形式。
+    """
     from app.timeutil import to_utc
 
     dt = to_utc(dt)
+    if dt.microsecond:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f").rstrip("0").rstrip(".") + "Z"
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")

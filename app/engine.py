@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.models import (
+    CALC_VERSION,
     EVENT_CLOSED,
     EVENT_EXTENDED,
     EVENT_REOPENED,
@@ -56,6 +57,57 @@ class ClosureWindow:
         if self.end is None:
             return None
         return int((self.end - point).total_seconds() // 60)
+
+
+@dataclass(frozen=True)
+class WindowVerdict:
+    """一次事件重算后有效窗口及其跨午夜裁定。
+
+    ``crosses_midnight`` 为三态：``None`` 表示开放窗口（结束日未知），
+    绝不伪造成 False/True。事件详情、机场汇总与航班分页只能引用同一裁定
+    版本（``calc_version``）下的结果。
+    """
+
+    airport_code: str
+    root_event_id: str
+    window_start: datetime
+    window_end: datetime | None
+    airport_timezone: str
+    crosses_midnight: bool | None
+    calc_version: int = CALC_VERSION
+
+    def to_row(self, event_id: str) -> dict[str, Any]:
+        return {
+            "event_id": event_id,
+            "root_event_id": self.root_event_id,
+            "airport_code": self.airport_code,
+            "window_start": iso_utc(self.window_start),
+            "window_end": iso_utc(self.window_end) if self.window_end else None,
+            "airport_timezone": self.airport_timezone,
+            "crosses_midnight": (
+                None if self.crosses_midnight is None else int(self.crosses_midnight)
+            ),
+            "calc_version": self.calc_version,
+        }
+
+
+def window_verdict(
+    event: DisruptionEvent,
+    root: DisruptionEvent,
+    airport: Airport,
+) -> WindowVerdict:
+    """按当前有效的半开区间语义计算窗口的跨午夜裁定（单一事实来源）。"""
+    window = chain_window(event, root, airport)
+    return WindowVerdict(
+        airport_code=window.airport_code,
+        root_event_id=window.root_event_id,
+        window_start=window.start,
+        window_end=window.end,
+        airport_timezone=airport.timezone,
+        crosses_midnight=crosses_local_midnight(
+            window.start, window.end, airport_tz(airport)
+        ),
+    )
 
 
 def chain_window(
@@ -172,13 +224,15 @@ def compute_impacts(
     root: DisruptionEvent,
     airport: Airport,
     flights: dict[str, Flight],
-) -> list[dict[str, Any]]:
-    """计算一个事件产生的完整且顺序稳定的影响快照。"""
+) -> tuple[WindowVerdict, list[dict[str, Any]]]:
+    """计算一个事件产生的完整且顺序稳定的影响快照。
+
+    返回窗口裁定与影响行；两者属于同一 ``calc_version``。跨午夜标志直接
+    引用窗口裁定，开放窗口为 ``None``，不会伪造结束日。
+    """
     window = chain_window(event, root, airport)
-    midnight = (
-        window.end is not None
-        and crosses_local_midnight(window.start, window.end, airport_tz(airport))
-    )
+    verdict = window_verdict(event, root, airport)
+    midnight = verdict.crosses_midnight
     rows: list[dict[str, Any]] = []
     for flight in sorted(flights.values(), key=lambda f: f.flight_id):
         record = classify_flight(flight, window)
@@ -186,9 +240,10 @@ def compute_impacts(
             continue
         record["event_id"] = event.event_id
         record["root_event_id"] = window.root_event_id
-        record["crosses_midnight"] = 1 if midnight else 0
+        record["crosses_midnight"] = None if midnight is None else int(midnight)
+        record["calc_version"] = verdict.calc_version
         rows.append(record)
-    return rows
+    return verdict, rows
 
 
 def airport_tz(airport: Airport):

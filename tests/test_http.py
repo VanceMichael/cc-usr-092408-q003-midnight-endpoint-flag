@@ -166,6 +166,80 @@ class HttpTest(ServiceTestCase):
         self.assertTrue(all(i["crosses_midnight"] for i in body["impacts"]))
         self.assertEqual(body["impact_count"], 3)
 
+    def test_exact_midnight_end_not_flagged_over_http(self) -> None:
+        # 23:00->00:00 local at APS; midnight is the open end, not inside.
+        payload = base_event(
+            event_id="evt-midnight0002",
+            effective_from="2026-09-07T15:00:00Z",
+            effective_until="2026-09-07T16:00:00Z",
+        )
+        status, body = _request("POST", f"{self.base}/api/v1/events", payload)
+        self.assertEqual(status, 201)
+        self.assertTrue(body["impacts"])
+        self.assertTrue(
+            all(i["crosses_midnight"] is False for i in body["impacts"])
+        )
+        self.assertEqual(body["projection_version"], 2)
+
+        status, fetched = _request(
+            "GET", f"{self.base}/api/v1/events/{body['event_id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(
+            fetched["processing"]["window_verdict"]["crosses_midnight"]
+        )
+        self.assertEqual(
+            fetched["processing"]["current_projection_version"],
+            fetched["processing"]["projection_version"],
+        )
+
+    def test_open_ended_flag_is_null_over_http(self) -> None:
+        payload = base_event(
+            event_id="evt-midnight0003",
+            airport_code="BSR",
+            effective_until=None,
+        )
+        status, body = _request("POST", f"{self.base}/api/v1/events", payload)
+        self.assertEqual(status, 201)
+        self.assertTrue(
+            all(i["crosses_midnight"] is None for i in body["impacts"])
+        )
+
+    def test_projection_version_shared_across_faces(self) -> None:
+        _request(
+            "POST",
+            f"{self.base}/api/v1/events",
+            base_event(
+                event_id="evt-midnight0004",
+                effective_from="2026-09-07T15:00:00Z",
+                effective_until="2026-09-07T16:00:00Z",
+            ),
+        )
+        _, detail = _request("GET", f"{self.base}/api/v1/events/evt-midnight0004")
+        _, summary = _request("GET", f"{self.base}/api/v1/airports/APS/summary")
+        _, page = _request(
+            "GET", f"{self.base}/api/v1/flights/affected?airport=APS"
+        )
+        version = detail["processing"]["projection_version"]
+        self.assertEqual(summary["projection_version"], version)
+        self.assertEqual(page["pagination"]["projection_version"], version)
+        self.assertTrue(
+            all(f["crosses_midnight"] is False for f in page["flights"])
+        )
+
+    def test_projection_amendments_endpoint_empty_on_fresh_db(self) -> None:
+        status, body = _request("GET", f"{self.base}/api/v1/projection-amendments")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"amendments": []})
+
+    def test_bad_projection_version_is_bad_request(self) -> None:
+        for raw in ("0", "bogus"):
+            status, body = _request(
+                "GET", f"{self.base}/api/v1/flights/affected?projection_version={raw}"
+            )
+            self.assertEqual(status, 400, raw)
+            self.assertEqual(body["error"]["code"], "bad_request")
+
 
 if __name__ == "__main__":
     unittest.main()

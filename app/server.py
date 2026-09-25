@@ -83,6 +83,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/events/{event_id}",
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
+                                "GET  /api/v1/projection-amendments",
                                 "GET  /healthz",
                             ],
                         },
@@ -92,7 +93,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 match = re.fullmatch(r"/api/v1/events/([A-Za-z0-9-]+)", path)
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.event_status(match.group(1)))
+                    self._send_json(
+                        200,
+                        state.service.event_status(
+                            match.group(1),
+                            projection_version=self._projection_version(query),
+                        ),
+                    )
                     return
 
                 match = re.fullmatch(
@@ -100,12 +107,36 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 )
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.airport_summary(match.group(1)))
+                    self._send_json(
+                        200,
+                        state.service.airport_summary(
+                            match.group(1),
+                            projection_version=self._projection_version(query),
+                        ),
+                    )
                     return
 
                 if path == "/api/v1/flights/affected":
                     self._require_method(method, "GET", path)
                     self._send_json(200, self._affected_flights(query))
+                    return
+
+                if path == "/api/v1/projection-amendments":
+                    self._require_method(method, "GET", path)
+                    event_id = None
+                    values = query.get("event_id")
+                    if values:
+                        if len(values) > 1:
+                            raise BadRequestError(
+                                "Query parameter 'event_id' must be provided once"
+                            )
+                        event_id = values[0]
+                    self._send_json(
+                        200,
+                        {
+                            "amendments": state.service.projection_amendments(event_id)
+                        },
+                    )
                     return
 
                 if path == "/api/v1/events":
@@ -187,7 +218,32 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 status=one("status"),
                 limit=limit,
                 offset=offset,
+                projection_version=self._projection_version(query),
             )
+
+        @staticmethod
+        def _projection_version(query: dict[str, list[str]]) -> int | None:
+            values = query.get("projection_version")
+            if values is None:
+                return None
+            if len(values) > 1:
+                raise BadRequestError(
+                    "Query parameter 'projection_version' must be provided once"
+                )
+            raw = values[0]
+            try:
+                value = int(raw)
+            except ValueError:
+                raise BadRequestError(
+                    "Query parameter 'projection_version' must be an integer",
+                    {"received": raw},
+                ) from None
+            if value < 1:
+                raise BadRequestError(
+                    "Query parameter 'projection_version' must be at least 1",
+                    {"received": value},
+                )
+            return value
 
         @staticmethod
         def _parse_int(
