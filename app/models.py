@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
+
+from app.timeutil import parse_stored_datetime, to_utc
 
 # Event type constants (mirrors contracts/disruption-event.schema.json)
 EVENT_CLOSED = "airport.closed"
@@ -86,8 +88,32 @@ class DisruptionEvent:
 
 
 def iso_utc(dt: datetime) -> str:
-    """将带时区时间输出为规范的 UTC ISO 8601 字符串。"""
-    from app.timeutil import to_utc
+    """将带时区时间输出为规范的 UTC ISO 8601 字符串。
 
+    整秒时刻保持 ``...T%H:%M:%SZ`` 形式；带微秒的时刻保留六位小数。
+    亚秒精度会影响半开区间端点（例如恰好止于本地午夜的窗口），持久化
+    时不得截断，否则数据库重开后重算结果会与写入时不一致。
+    """
     dt = to_utc(dt)
+    if dt.microsecond:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def event_from_record(record: Mapping[str, Any]) -> DisruptionEvent:
+    """从持久化行重建事件；时间列必须是规范 UTC 串。"""
+    return DisruptionEvent(
+        event_id=record["event_id"],
+        event_version=record["event_version"],
+        event_type=record["event_type"],
+        airport_code=record["airport_code"],
+        effective_from=parse_stored_datetime(record["effective_from"]),
+        effective_until=(
+            parse_stored_datetime(record["effective_until"])
+            if record["effective_until"]
+            else None
+        ),
+        reported_at=parse_stored_datetime(record["reported_at"]),
+        supersedes_event_id=record["supersedes_event_id"],
+        reason=record["reason"],
+    )

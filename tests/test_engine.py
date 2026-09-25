@@ -184,6 +184,124 @@ class EngineTest(ServiceTestCase):
         self.assertEqual(record["delay_minutes"], 15)
         self.assertEqual(record["affected_endpoint"], "destination")
 
+    def test_window_ending_exactly_at_local_midnight_not_flagged(self) -> None:
+        # 15:00-16:00Z == 23:00-00:00 local at APS: the 00:00 instant is
+        # excluded by the half-open window, so the closure stays on one day.
+        result = self.service.submit_event(
+            {
+                "event_id": "evt-midexact001",
+                "event_version": 1,
+                "event_type": "airport.closed",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:00:00Z",
+                "effective_until": "2026-09-07T16:00:00Z",
+                "reported_at": "2026-09-07T14:00:00Z",
+            }
+        )
+        self.assertTrue(result["impacts"])
+        self.assertFalse(any(i["crosses_midnight"] for i in result["impacts"]))
+
+    def test_window_ending_microseconds_after_local_midnight_flagged(self) -> None:
+        result = self.service.submit_event(
+            {
+                "event_id": "evt-midmicro001",
+                "event_version": 1,
+                "event_type": "airport.closed",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:00:00Z",
+                "effective_until": "2026-09-07T16:00:00.000001Z",
+                "reported_at": "2026-09-07T14:00:00Z",
+            }
+        )
+        self.assertTrue(result["impacts"])
+        self.assertTrue(all(i["crosses_midnight"] for i in result["impacts"]))
+
+    def test_open_ended_closure_never_fabricates_end_date(self) -> None:
+        # Open-ended closure: pending_confirmation, no numeric overlap, no
+        # cross-midnight flag derived from an invented end date.
+        result = self.service.submit_event(
+            {
+                "event_id": "evt-openend0001",
+                "event_version": 1,
+                "event_type": "airport.closed",
+                "airport_code": "BSR",
+                "effective_from": "2026-09-07T15:00:00Z",
+                "effective_until": None,
+                "reported_at": "2026-09-07T14:00:00Z",
+            }
+        )
+        self.assertTrue(result["impacts"])
+        for impact in result["impacts"]:
+            self.assertEqual(impact["impact_status"], "pending_confirmation")
+            self.assertIsNone(impact["overlap_minutes"])
+            self.assertIsNone(impact["delay_minutes"])
+            self.assertIsNone(impact["proposed_departure"])
+            self.assertFalse(impact["crosses_midnight"])
+
+    def test_extension_updates_cross_midnight_flag(self) -> None:
+        # Closure 23:00-00:00 local: not cross-day. Extending the same chain
+        # to 03:00 local must flip the flag on the extension's snapshot while
+        # the original event's snapshot stays unchanged.
+        closed = self.service.submit_event(
+            {
+                "event_id": "evt-extflag0001",
+                "event_version": 1,
+                "event_type": "airport.closed",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:00:00Z",
+                "effective_until": "2026-09-07T16:00:00Z",
+                "reported_at": "2026-09-07T14:00:00Z",
+            }
+        )
+        self.assertFalse(any(i["crosses_midnight"] for i in closed["impacts"]))
+        extended = self.service.submit_event(
+            {
+                "event_id": "evt-extflag0002",
+                "event_version": 2,
+                "event_type": "airport.extended",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:50:00Z",
+                "effective_until": "2026-09-07T19:00:00Z",
+                "reported_at": "2026-09-07T15:00:00Z",
+                "supersedes_event_id": "evt-extflag0001",
+            }
+        )
+        self.assertTrue(extended["impacts"])
+        self.assertTrue(all(i["crosses_midnight"] for i in extended["impacts"]))
+        original = self.service.event_status("evt-extflag0001")
+        self.assertFalse(any(i["crosses_midnight"] for i in original["impacts"]))
+
+    def test_reopen_updates_cross_midnight_flag(self) -> None:
+        # Closure 23:00-03:00 local is cross-day; reopening so operations
+        # resume exactly at local midnight shrinks the window to a single day.
+        closed = self.service.submit_event(
+            {
+                "event_id": "evt-reopflag001",
+                "event_version": 1,
+                "event_type": "airport.closed",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:00:00Z",
+                "effective_until": "2026-09-07T19:00:00Z",
+                "reported_at": "2026-09-07T14:00:00Z",
+            }
+        )
+        self.assertTrue(all(i["crosses_midnight"] for i in closed["impacts"]))
+        # Reopen 15:40Z; APS's 20 minute buffer resumes operations 16:00Z,
+        # exactly local midnight -> effective window [23:00, 00:00) local.
+        reopened = self.service.submit_event(
+            {
+                "event_id": "evt-reopflag002",
+                "event_version": 2,
+                "event_type": "airport.reopened",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T15:40:00Z",
+                "reported_at": "2026-09-07T15:45:00Z",
+                "supersedes_event_id": "evt-reopflag001",
+            }
+        )
+        self.assertTrue(reopened["impacts"])
+        self.assertFalse(any(i["crosses_midnight"] for i in reopened["impacts"]))
+
 
 if __name__ == "__main__":
     unittest.main()

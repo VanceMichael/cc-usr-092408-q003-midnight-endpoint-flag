@@ -4,6 +4,9 @@
 
 * 比较前将所有时间统一转换为带时区的 UTC。时间窗口采用左闭右开语义，
   端点相接不算重叠。
+* 跨日判定遵循同一半开区间语义：窗口覆盖的最后时刻是 ``end`` 前一微秒，
+  因此恰好止于本地午夜的窗口不跨日；开放式关闭不伪造结束时间，也不
+  标记跨日。
 * 航班从受影响机场起飞或抵达受影响机场的计划时刻落入关闭窗口时受影响。
 * ``airport.closed`` 建立事件链，``effective_until = null`` 表示结束时间未知。
 * ``airport.extended`` 延续事件链，并把窗口延长到当前事件的结束时刻。
@@ -31,6 +34,11 @@ from app.models import (
 )
 from app.timeutil import crosses_local_midnight
 from app.models import iso_utc
+
+# 投影（计算）版本，随影响计算规则的修正递增：
+# 1 = 旧逻辑：止于本地午夜的窗口被误标为跨日；
+# 2 = 半开区间修正：终点恰好落在本地午夜的窗口不跨日。
+CURRENT_PROJECTION_VERSION = 2
 
 # Severity ordering used when one flight is affected at both endpoints.
 _SEVERITY = {IMPACT_DELAYED: 0, IMPACT_PENDING: 1, IMPACT_CANCELLED: 2}
@@ -187,6 +195,7 @@ def compute_impacts(
         record["event_id"] = event.event_id
         record["root_event_id"] = window.root_event_id
         record["crosses_midnight"] = 1 if midnight else 0
+        record["projection_version"] = CURRENT_PROJECTION_VERSION
         rows.append(record)
     return rows
 

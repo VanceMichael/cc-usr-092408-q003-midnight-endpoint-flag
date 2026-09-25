@@ -166,6 +166,77 @@ class HttpTest(ServiceTestCase):
         self.assertTrue(all(i["crosses_midnight"] for i in body["impacts"]))
         self.assertEqual(body["impact_count"], 3)
 
+    def test_midnight_exact_window_over_http_not_flagged(self) -> None:
+        # 23:00 -> 00:00 local at APS: the midnight endpoint is excluded.
+        payload = base_event(
+            event_id="evt-midexact0001",
+            effective_from="2026-09-07T23:00:00+08:00",
+            effective_until="2026-09-08T00:00:00+08:00",
+        )
+        status, body = _request("POST", f"{self.base}/api/v1/events", payload)
+        self.assertEqual(status, 201)
+        self.assertGreater(body["impact_count"], 0)
+        self.assertFalse(any(i["crosses_midnight"] for i in body["impacts"]))
+
+    def test_projection_version_consistent_across_endpoints(self) -> None:
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        _, event = _request("GET", f"{self.base}/api/v1/events/evt-close0000001")
+        _, summary = _request("GET", f"{self.base}/api/v1/airports/APS/summary")
+        _, flights = _request("GET", f"{self.base}/api/v1/flights/affected")
+        versions = {
+            event["projection_version"],
+            summary["projection_version"],
+            flights["projection_version"],
+        }
+        self.assertEqual(len(versions), 1)
+
+    def test_projection_version_parameter(self) -> None:
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        _, default = _request("GET", f"{self.base}/api/v1/events/evt-close0000001")
+        current = default["projection_version"]
+
+        status, explicit = _request(
+            "GET",
+            f"{self.base}/api/v1/events/evt-close0000001?projection_version={current}",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(explicit["impacts"], default["impacts"])
+
+        # 该事件没有版本 1 的裁定：回看旧版本得到空影响集
+        status, legacy = _request(
+            "GET", f"{self.base}/api/v1/events/evt-close0000001?projection_version=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(legacy["projection_version"], 1)
+        self.assertEqual(legacy["impacts"], [])
+
+        status, body = _request(
+            "GET", f"{self.base}/api/v1/events/evt-close0000001?projection_version=99"
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+        status, body = _request(
+            "GET", f"{self.base}/api/v1/events/evt-close0000001?projection_version=abc"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+
+        # 汇总与分页接受同一参数
+        status, summary = _request(
+            "GET", f"{self.base}/api/v1/airports/APS/summary?projection_version=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(summary["projection_version"], 1)
+        self.assertEqual(summary["affected_flights"], 0)
+
+        status, page = _request(
+            "GET", f"{self.base}/api/v1/flights/affected?projection_version=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["projection_version"], 1)
+        self.assertEqual(page["pagination"]["total"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

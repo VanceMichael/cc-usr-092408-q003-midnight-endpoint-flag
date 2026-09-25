@@ -74,13 +74,28 @@ def overlap_minutes(
     return max(0, int((end - start).total_seconds() // 60))
 
 
+def parse_stored_datetime(value: str) -> datetime:
+    """解析持久化的 UTC 时间串（兼容 Z 后缀与小数秒）。"""
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    return datetime.fromisoformat(text).astimezone(timezone.utc)
+
+
 def crosses_local_midnight(
     start: datetime, end: datetime, tz: ZoneInfo
 ) -> bool:
-    """判断左闭右开区间在指定时区内是否跨越两个自然日。"""
+    """判断左闭右开区间 [start, end) 在指定时区内是否覆盖两个自然日。
+
+    终点本身不属于窗口：覆盖的最后时刻是 ``end`` 前一微秒。因此恰好止于
+    本地午夜的窗口不跨日，而止于午夜之后任何可分辨时刻（哪怕一微秒）的
+    窗口跨日。回退在 UTC 域内进行、再换算本地日期，因此不同 UTC 偏移的
+    输入与夏令时切换（23/25 小时的自然日）都遵循同一半开区间语义。
+    空区间（end <= start）不覆盖任何时刻，不跨日。
+    """
+    if end <= start:
+        return False
     local_start = start.astimezone(tz)
-    local_end = end.astimezone(tz)
-    return local_start.date() != local_end.date()
+    last_covered = (end - timedelta(microseconds=1)).astimezone(tz)
+    return local_start.date() != last_covered.date()
 
 
 def minutes_until(start: datetime, end: datetime) -> int:

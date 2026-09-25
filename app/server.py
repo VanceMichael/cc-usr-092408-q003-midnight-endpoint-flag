@@ -92,7 +92,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 match = re.fullmatch(r"/api/v1/events/([A-Za-z0-9-]+)", path)
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.event_status(match.group(1)))
+                    self._send_json(
+                        200,
+                        state.service.event_status(
+                            match.group(1),
+                            projection_version=self._projection_version(query),
+                        ),
+                    )
                     return
 
                 match = re.fullmatch(
@@ -100,7 +106,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 )
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.airport_summary(match.group(1)))
+                    self._send_json(
+                        200,
+                        state.service.airport_summary(
+                            match.group(1),
+                            projection_version=self._projection_version(query),
+                        ),
+                    )
                     return
 
                 if path == "/api/v1/flights/affected":
@@ -169,24 +181,42 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 ) from None
             return payload
 
-        def _affected_flights(self, query: dict[str, list[str]]) -> dict[str, Any]:
-            def one(name: str) -> str | None:
-                values = query.get(name)
-                if values is None:
-                    return None
-                if len(values) > 1:
-                    raise BadRequestError(
-                        f"Query parameter '{name}' must be provided once"
-                    )
-                return values[0]
+        @staticmethod
+        def _query_one(query: dict[str, list[str]], name: str) -> str | None:
+            values = query.get(name)
+            if values is None:
+                return None
+            if len(values) > 1:
+                raise BadRequestError(
+                    f"Query parameter '{name}' must be provided once"
+                )
+            return values[0]
 
-            limit = self._parse_int(one("limit"), DEFAULT_LIMIT, "limit", 1, MAX_LIMIT)
-            offset = self._parse_int(one("offset"), 0, "offset", 0, 100_000)
+        def _projection_version(self, query: dict[str, list[str]]) -> int | None:
+            raw = self._query_one(query, "projection_version")
+            if raw is None:
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                raise BadRequestError(
+                    "Query parameter 'projection_version' must be an integer",
+                    {"received": raw},
+                ) from None
+
+        def _affected_flights(self, query: dict[str, list[str]]) -> dict[str, Any]:
+            limit = self._parse_int(
+                self._query_one(query, "limit"), DEFAULT_LIMIT, "limit", 1, MAX_LIMIT
+            )
+            offset = self._parse_int(
+                self._query_one(query, "offset"), 0, "offset", 0, 100_000
+            )
             return state.service.affected_flights(
-                airport=one("airport"),
-                status=one("status"),
+                airport=self._query_one(query, "airport"),
+                status=self._query_one(query, "status"),
                 limit=limit,
                 offset=offset,
+                projection_version=self._projection_version(query),
             )
 
         @staticmethod

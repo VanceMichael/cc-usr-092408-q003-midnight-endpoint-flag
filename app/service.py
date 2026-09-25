@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any
 
+from app.engine import CURRENT_PROJECTION_VERSION, compute_impacts
 from app.errors import EventConflictError, NotFoundError, ValidationError
-from app.engine import compute_impacts
+from app.migration import ensure_current_projection
 from app.models import (
     EVENT_CLOSED,
     EVENT_EXTENDED,
@@ -15,8 +15,10 @@ from app.models import (
     Airport,
     DisruptionEvent,
     Flight,
+    event_from_record,
 )
 from app.repository import Repository
+from app.timeutil import parse_stored_datetime
 from app.validation import validate_event
 
 
@@ -30,6 +32,9 @@ class DisruptionService:
         self._repo = repo
         self._airports = airports
         self._flights = flights
+        # 服务任何请求前，把已写入的影响推进到当前计算版本（可审计迁移，
+        # 已是最新时为空操作）。
+        ensure_current_projection(self._repo, self._airports)
 
     def healthy(self) -> bool:
         return self._repo.ping()
@@ -93,6 +98,7 @@ class DisruptionService:
                     "proposed_arrival": None,
                     "passenger_count": flight.passenger_count,
                     "crosses_midnight": 0,
+                    "projection_version": CURRENT_PROJECTION_VERSION,
                 }
             )
         return tombstones
@@ -107,7 +113,9 @@ class DisruptionService:
         if same_body:
             # Idempotent retry: return the original result, bump the counter.
             self._repo.increment_replay(conn, event.event_id)
-            impacts = self._repo.get_impacts(event.event_id)
+            impacts = self._repo.get_impacts(
+                event.event_id, self._repo.current_projection_version()
+            )
             return self._result(event, [dict(r) for r in impacts], replayed=True)
 
         # Same identity, different content.
@@ -197,7 +205,7 @@ class DisruptionService:
             # an open-ended closure simply supplies the newly known end.
             prev_until_raw = ref["effective_until"]
             if prev_until_raw is None:
-                if event.effective_from < parse_ts(ref["effective_from"]):
+                if event.effective_from < parse_stored_datetime(ref["effective_from"]):
                     errors.append(
                         {
                             "field": "effective_from",
@@ -205,7 +213,7 @@ class DisruptionService:
                         }
                     )
             else:
-                prev_until = parse_ts(prev_until_raw)
+                prev_until = parse_stored_datetime(prev_until_raw)
                 if event.effective_from > prev_until:
                     errors.append(
                         {
@@ -260,7 +268,7 @@ class DisruptionService:
             ).fetchone()
             if row is None:  # validated earlier; defensive
                 raise ValidationError(f"unknown superseded event '{ref_id}'")
-            current = _row_to_event(row)
+            current = event_from_record(row)
             if current.event_type == EVENT_CLOSED:
                 return current
         raise ValidationError("extended/reopened event chain has no closed root")
@@ -269,13 +277,32 @@ class DisruptionService:
     # Queries
     # ------------------------------------------------------------------ #
 
-    def event_status(self, event_id: str) -> dict[str, Any]:
+    def _resolve_projection_version(self, requested: int | None) -> int:
+        """确定查询使用的投影版本；缺省为当前版本，越界版本拒绝。"""
+        current = self._repo.current_projection_version()
+        if requested is None:
+            return current
+        if not 1 <= requested <= current:
+            raise ValidationError(
+                "Unsupported projection version",
+                {
+                    "field": "projection_version",
+                    "requested": str(requested),
+                    "current_version": str(current),
+                },
+            )
+        return requested
+
+    def event_status(
+        self, event_id: str, projection_version: int | None = None
+    ) -> dict[str, Any]:
+        version = self._resolve_projection_version(projection_version)
         row = self._repo.get_event_row(event_id)
         if row is None:
             raise NotFoundError(
                 f"Event '{event_id}' was not found", {"event_id": event_id}
             )
-        impact_rows = self._repo.get_impacts(event_id)
+        impact_rows = self._repo.get_impacts(event_id, version)
         impacts = [self._impact_dict(r) for r in impact_rows]
         active = [i for i in impacts if i["impact_status"] != "resolved"]
         statuses: dict[str, int] = {}
@@ -285,6 +312,7 @@ class DisruptionService:
             passengers += imp["passenger_count"]
         return {
             "event": json.loads(row["payload_json"]),
+            "projection_version": version,
             "processing": {
                 "state": "processed",
                 "replay_count": row["replay_count"],
@@ -297,14 +325,19 @@ class DisruptionService:
             "impacts": active,
         }
 
-    def airport_summary(self, airport_code: str) -> dict[str, Any]:
+    def airport_summary(
+        self, airport_code: str, projection_version: int | None = None
+    ) -> dict[str, Any]:
         if airport_code not in self._airports:
             raise NotFoundError(
                 f"Unknown airport code '{airport_code}'",
                 {"field": "airport_code", "received": airport_code},
             )
+        version = self._resolve_projection_version(projection_version)
         rows = self._repo.events_for_airport(airport_code)
-        latest = self._repo.latest_impacts(airport=airport_code)
+        latest = self._repo.latest_impacts(
+            airport=airport_code, projection_version=version
+        )
         by_status: dict[str, dict[str, Any]] = {}
         total_passengers = 0
         for r in latest:
@@ -320,6 +353,7 @@ class DisruptionService:
         return {
             "airport_code": airport_code,
             "airport_name": self._airports[airport_code].name,
+            "projection_version": version,
             "event_count": len(rows),
             "active_chains": len(chain_roots)
             - sum(1 for r in rows if r["event_type"] == EVENT_REOPENED),
@@ -335,6 +369,7 @@ class DisruptionService:
         status: str | None,
         limit: int,
         offset: int,
+        projection_version: int | None = None,
     ) -> dict[str, Any]:
         if airport is not None and airport not in self._airports:
             raise NotFoundError(
@@ -347,10 +382,14 @@ class DisruptionService:
                 "Unsupported impact status filter",
                 {"field": "status", "allowed": sorted(allowed)},
             )
-        rows = self._repo.latest_impacts(airport=airport, status=status)
+        version = self._resolve_projection_version(projection_version)
+        rows = self._repo.latest_impacts(
+            airport=airport, status=status, projection_version=version
+        )
         total = len(rows)
         page = rows[offset : offset + limit]
         return {
+            "projection_version": version,
             "pagination": {
                 "limit": limit,
                 "offset": offset,
@@ -377,6 +416,7 @@ class DisruptionService:
             "event_id": event.event_id,
             "event_version": event.event_version,
             "processing_state": "replayed" if replayed else "processed",
+            "projection_version": self._repo.current_projection_version(),
             "impact_count": len(serialized),
             "resolved_count": len(impacts) - len(active_impacts),
             "affected_passengers": passengers,
@@ -403,22 +443,3 @@ class DisruptionService:
             "passenger_count": row["passenger_count"],
             "crosses_midnight": bool(row["crosses_midnight"]),
         }
-
-
-def parse_ts(value: str) -> datetime:
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
-    return datetime.fromisoformat(text).astimezone(timezone.utc)
-
-
-def _row_to_event(row) -> DisruptionEvent:
-    return DisruptionEvent(
-        event_id=row["event_id"],
-        event_version=row["event_version"],
-        event_type=row["event_type"],
-        airport_code=row["airport_code"],
-        effective_from=parse_ts(row["effective_from"]),
-        effective_until=parse_ts(row["effective_until"]) if row["effective_until"] else None,
-        reported_at=parse_ts(row["reported_at"]),
-        supersedes_event_id=row["supersedes_event_id"],
-        reason=row["reason"],
-    )
